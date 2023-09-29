@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <iostream>
 #include <cmath>
+#include <random>
 
 constexpr std::uint64_t MAX_OPERANDS = 3;
 constexpr std::uint8_t SENTINEL = -1;
+constexpr std::uint64_t N_BIGGEST_AMPLITUDES = 10;
 
 struct Entry {
     std::uint32_t gateIndex = 0;
@@ -22,7 +24,7 @@ struct Entry {
 using Circuit = std::vector<Entry>;
 using Ket = std::bitset<256>;
 using State = std::unordered_map<Ket, std::complex<double>>;
-using BiggestAmplitudes = std::vector<std::pair<Ket, std::complex<double>>>;
+using BiggestAmplitudes = std::array<std::pair<Ket, std::complex<double>>, N_BIGGEST_AMPLITUDES>;
 
 struct StackEntry {
     Circuit::const_iterator iterator;
@@ -35,7 +37,7 @@ inline bool matchesEntry(Entry entry, Ket ket) {
     assert(!ket[SENTINEL]);
 
     auto ketJ = 0;
-    assert(!ket.test(entry.operands[SENTINEL]));
+    assert(!ket.test(SENTINEL));
     for (auto opIndex = 0; opIndex < MAX_OPERANDS; ++opIndex) {
         ketJ |= (ket.test(entry.operands[opIndex]) << opIndex);
     }
@@ -45,9 +47,10 @@ inline bool matchesEntry(Entry entry, Ket ket) {
 
 void down(Stack& stack, Ket& ket, Circuit const& circuit) {
     while (true) {
-        auto it = stack.empty() ? circuit.cbegin() :
+        auto it = stack.empty() ? std::find_if(circuit.begin(), circuit.cend(), [ket](auto const& x) {
+                return matchesEntry(x, ket);
+                }) :
             std::find_if(stack.back().iterator, circuit.cend(), [&](auto const& x) {
-                assert(stack.back().iterator != circuit.cend());
                 return x.gateIndex != stack.back().iterator->gateIndex && matchesEntry(x, ket);
             });
         
@@ -108,7 +111,7 @@ void upAndAdvance(Stack& stack, Ket& ket, Circuit const& circuit) {
     }
 }
 
-BiggestAmplitudes getMostLikelyAmplitudes(Circuit circuit) {
+std::pair<BiggestAmplitudes, std::size_t> getMostLikelyAmplitudes(Circuit circuit) {
     auto numberOfGates = circuit.back().gateIndex + 1;
     std::uint8_t qubitCount = 0;
     for (auto const& entry: circuit) {
@@ -121,9 +124,7 @@ BiggestAmplitudes getMostLikelyAmplitudes(Circuit circuit) {
 
     State currentPartialState;
 
-    std::uint64_t nBiggestAmplitudes = 10;
     BiggestAmplitudes biggestAmplitudes;
-    biggestAmplitudes.reserve(nBiggestAmplitudes);
 
     Stack stack;
     stack.reserve(numberOfGates);
@@ -140,6 +141,8 @@ BiggestAmplitudes getMostLikelyAmplitudes(Circuit circuit) {
         mask >>= 256 - 64;
         return ((ket >> rightBits) & mask).to_ullong();
     };
+
+    std::size_t numberBiggestAmplitudes = 0;
 
     for (std::uint64_t bucket = 0; bucket <= maxBucket; ++bucket) {
         assert(currentPartialState.empty());
@@ -162,24 +165,26 @@ BiggestAmplitudes getMostLikelyAmplitudes(Circuit circuit) {
             upAndAdvance(stack, ket, circuit);
         } while (!stack.empty());
 
-        BiggestAmplitudes partialBiggestAmplitudes(nBiggestAmplitudes, std::make_pair(Ket{}, 0.));
+        BiggestAmplitudes partialBiggestAmplitudes;
         auto top = std::partial_sort_copy(currentPartialState.begin(), currentPartialState.end(), partialBiggestAmplitudes.begin(), partialBiggestAmplitudes.end(),
             [](auto left, auto right) {
                 return std::norm(left.second) > std::norm(right.second);
             });
         
-        BiggestAmplitudes outputBiggestAmplitudes;
-        std::merge(biggestAmplitudes.begin(), biggestAmplitudes.end(), partialBiggestAmplitudes.begin(), top, std::back_inserter(outputBiggestAmplitudes),
+        numberBiggestAmplitudes = std::min(N_BIGGEST_AMPLITUDES, std::distance(partialBiggestAmplitudes.begin(), top) + numberBiggestAmplitudes);
+        
+        std::array<std::pair<Ket, std::complex<double>>, 2 * N_BIGGEST_AMPLITUDES> outputBiggestAmplitudes;
+        std::merge(biggestAmplitudes.begin(), biggestAmplitudes.end(), partialBiggestAmplitudes.begin(), top, outputBiggestAmplitudes.begin(),
             [](auto left, auto right) {
                 return std::norm(left.second) > std::norm(right.second);
             });
 
-        biggestAmplitudes.swap(outputBiggestAmplitudes);
+        std::copy(outputBiggestAmplitudes.begin(), std::next(outputBiggestAmplitudes.begin(), N_BIGGEST_AMPLITUDES), biggestAmplitudes.begin());
 
         currentPartialState.clear();
     }
 
-    return biggestAmplitudes;
+    return { biggestAmplitudes, numberBiggestAmplitudes };
 }
 
 class CircuitBuilder {
@@ -198,6 +203,50 @@ public:
     CircuitBuilder& cnot(std::uint8_t operand1, std::uint8_t operand2) {
         push({operand1, operand2}, {{0, 0, 1.}, {1, 1, 1.}, {2, 3, 1.}, {3, 2, 1.}});
         return *this;
+    }
+
+    CircuitBuilder& random(std::uint8_t operand) {
+        // This ignores Haar measure - just for benchmarking.
+
+        double alpha = dis(re);
+        double beta = dis(re);
+        double delta = dis(re);
+        double gamma = dis(re);
+
+        auto s = std::sin(gamma / 2.);
+        auto c = std::cos(gamma / 2.);
+
+        push({operand}, {
+            {0, 0,   std::polar(1., alpha - beta / 2 - delta / 2) * c},
+            {0, 1, - std::polar(1., alpha - beta / 2 + delta / 2) * s},
+            {1, 0,   std::polar(1., alpha + beta / 2 - delta / 2) * s},
+            {1, 1,   std::polar(1., alpha + beta / 2 + delta / 2) * c}
+        });
+        return *this;
+    }
+
+    static Circuit createRandom(std::uint8_t num_qubits, std::uint64_t num_gates, double probaOfCnot) {
+        assert(0 <= probaOfCnot && probaOfCnot <= 1);
+
+        CircuitBuilder builder;
+        std::default_random_engine re;
+        std::bernoulli_distribution bernoulli(probaOfCnot);
+        std::uniform_int_distribution<std::uint8_t> operands(0, num_qubits);
+
+        while (num_gates > 0) {
+            auto operand1 = operands(re);
+            auto operand2 = operands(re);
+
+            if (bernoulli(re)) {
+                builder.cnot(operand1, operand2);
+            } else {
+                builder.random(operand1);
+            }
+
+            --num_gates;
+        }
+
+        return builder.get();
     }
 
     Circuit get() {
@@ -227,17 +276,79 @@ private:
         ++gateIndex;
     }
 
+    std::uniform_real_distribution<double> dis{0, 1000};
+    std::default_random_engine re; // Always the same seed here.
+
     std::uint32_t gateIndex = 0;
     Circuit circuit;
 };
 
+void check(Circuit circuit, Ket ket, std::complex<double> expectedAmplitude) {
+    auto [result, nAmplitudes] = getMostLikelyAmplitudes(circuit);
+
+    auto max = std::next(result.begin(), nAmplitudes);
+
+    auto it = std::find_if(result.begin(), max, [ket](auto x) {
+        return x.first == ket;
+    });
+
+    if (it == max) {
+        throw std::runtime_error("[TEST FAILURE] Did not found amplitude for " + ket.to_string());
+    }
+
+    if (std::norm(it->second - expectedAmplitude) > 0.0000001) {
+        throw std::runtime_error("[TEST FAILURE] Wrong amplitude for " + ket.to_string() + ": got " + std::to_string(it->second.real()) + " + i" + std::to_string(it->second.imag()) + " but expected "
+            + std::to_string(expectedAmplitude.real()) + " + i" + std::to_string(expectedAmplitude.imag()) );
+    }
+}
+
+void checkNot(Circuit circuit, Ket ket) {
+    auto [result, nAmplitudes] = getMostLikelyAmplitudes(circuit);
+
+    auto max = std::next(result.begin(), nAmplitudes);
+
+    auto it = std::find_if(result.begin(), max, [ket](auto x) {
+        return x.first == ket;
+    });
+
+    if (it != max) {
+        throw std::runtime_error("[TEST FAILURE] Expected no amplitude but got one for " + ket.to_string());
+    }
+}
+
+void test() {
+    using C = CircuitBuilder;
+
+    check(C().h(0).get(), Ket("01"), sqrt(0.5));
+    checkNot(C().h(0).get(), Ket("10"));
+    check(C().h(0).h(1).get(), Ket("11"), 0.5);
+    check(C().h(0).h(1).get(), Ket("01"), 0.5);
+    check(C().h(0).h(0).get(), Ket("0"), 1.);
+    checkNot(C().h(0).h(0).get(), Ket("1"));
+    check(C().x(4).h(4).get(), Ket("00000"), sqrt(0.5));
+    check(C().x(4).h(4).get(), Ket("10000"), -sqrt(0.5));
+    check(C().h(0).cnot(0, 1).get(), Ket("11"), sqrt(0.5));
+    check(C().x(0).get(), Ket("1"), 1.);
+    checkNot(C().x(0).get(), Ket("0"));
+    check(C().x(2).get(), Ket("100"), 1.);
+    checkNot(C().x(2).get(), Ket("101"));
+    check(C().x(3).cnot(3, 5).get(), Ket("101000"), 1.);
+    check(C().x(2).cnot(3, 5).get(), Ket("000100"), 1.);
+}
+
 int main() {
-    auto circuit = CircuitBuilder().h(0).h(1).h(2).h(3).h(4).h(5).get();
+    test();
 
-    auto result = getMostLikelyAmplitudes(circuit);
+    std::uint8_t num_qubits = 20;
+    std::uint64_t num_gates = 40;
+    double probaOfCnot = 0.5;
 
-    for (auto [k, v]: result) {
-        std::cout << k << "   ->    " << v << std::endl;
+    auto circuit = CircuitBuilder::createRandom(num_qubits, num_gates, probaOfCnot);
+
+    auto [result, count] = getMostLikelyAmplitudes(circuit);
+
+    for (auto it = result.begin(); it != std::next(result.begin(), count); ++it) {
+        std::cout << it->first << "   ->    " << it->second << std::endl;
     }
 
     return 0;
