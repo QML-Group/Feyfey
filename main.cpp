@@ -6,6 +6,7 @@
 #include <cassert>
 #include <algorithm>
 #include <iostream>
+#include <array>
 #include <cmath>
 #include <random>
 
