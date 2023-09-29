@@ -22,6 +22,7 @@ struct Entry {
 using Circuit = std::vector<Entry>;
 using Ket = std::bitset<256>;
 using State = std::unordered_map<Ket, std::complex<double>>;
+using BiggestAmplitudes = std::vector<std::pair<Ket, std::complex<double>>>;
 
 struct StackEntry {
     Circuit::const_iterator iterator;
@@ -107,34 +108,78 @@ void upAndAdvance(Stack& stack, Ket& ket, Circuit const& circuit) {
     }
 }
 
-State getFinalState(Circuit circuit) {
-    State result;
+BiggestAmplitudes getMostLikelyAmplitudes(Circuit circuit) {
+    auto numberOfGates = circuit.back().gateIndex + 1;
+    std::uint8_t qubitCount = 0;
+    for (auto const& entry: circuit) {
+        for (auto op: entry.operands) {
+            if (op != SENTINEL) {
+                qubitCount = std::max(qubitCount, static_cast<std::uint8_t>(op + 1));
+            }
+        }
+    }
+
+    State currentPartialState;
+
+    std::uint64_t nBiggestAmplitudes = 10;
+    BiggestAmplitudes biggestAmplitudes;
+    biggestAmplitudes.reserve(nBiggestAmplitudes);
 
     Stack stack;
+    stack.reserve(numberOfGates);
 
     Ket ket;
 
-    auto numberOfGates = circuit.back().gateIndex + 1;
+    std::uint64_t rightBits = 10;
+    std::uint64_t maxBitsInBucket = (qubitCount <= rightBits) ? 0 : (qubitCount - rightBits);
+    std::uint64_t maxBucket = (maxBitsInBucket < 64) ? ((1 << maxBitsInBucket) - 1) : ~0ULL;
 
-    do {
-        down(stack, ket, circuit);
-        
-        assert(stack.size() <= numberOfGates);
+    auto getBucket = [rightBits](Ket ket) -> std::uint64_t {
+        Ket mask;
+        mask.set();
+        mask >>= 256 - 64;
+        return ((ket >> rightBits) & mask).to_ullong();
+    };
 
-        if (stack.size() == numberOfGates) {
-            auto [it, inserted] = result.insert({ket, stack.back().c});
-            if (!inserted) {
-                it->second += stack.back().c;
-                if (std::norm(it->second) < 0.000001) {
-                    result.erase(it);
+    for (std::uint64_t bucket = 0; bucket <= maxBucket; ++bucket) {
+        assert(currentPartialState.empty());
+
+        do {
+            down(stack, ket, circuit);
+            
+            assert(stack.size() <= numberOfGates);
+
+            if (stack.size() == numberOfGates && getBucket(ket) == bucket) {
+                auto [it, inserted] = currentPartialState.insert({ket, stack.back().c});
+                if (!inserted) {
+                    it->second += stack.back().c;
+                    if (std::norm(it->second) < 0.000001) {
+                        currentPartialState.erase(it);
+                    }
                 }
             }
-        }
 
-        upAndAdvance(stack, ket, circuit);
-    } while (!stack.empty());
+            upAndAdvance(stack, ket, circuit);
+        } while (!stack.empty());
 
-    return result;
+        BiggestAmplitudes partialBiggestAmplitudes(nBiggestAmplitudes, std::make_pair(Ket{}, 0.));
+        auto top = std::partial_sort_copy(currentPartialState.begin(), currentPartialState.end(), partialBiggestAmplitudes.begin(), partialBiggestAmplitudes.end(),
+            [](auto left, auto right) {
+                return std::norm(left.second) > std::norm(right.second);
+            });
+        
+        BiggestAmplitudes outputBiggestAmplitudes;
+        std::merge(biggestAmplitudes.begin(), biggestAmplitudes.end(), partialBiggestAmplitudes.begin(), top, std::back_inserter(outputBiggestAmplitudes),
+            [](auto left, auto right) {
+                return std::norm(left.second) > std::norm(right.second);
+            });
+
+        biggestAmplitudes.swap(outputBiggestAmplitudes);
+
+        currentPartialState.clear();
+    }
+
+    return biggestAmplitudes;
 }
 
 class CircuitBuilder {
@@ -187,9 +232,9 @@ private:
 };
 
 int main() {
-    auto circuit = CircuitBuilder().h(10).cnot(10, 11).cnot(11, 12).h(1).get();
+    auto circuit = CircuitBuilder().h(0).h(1).h(2).h(3).h(4).h(5).get();
 
-    auto result = getFinalState(circuit);
+    auto result = getMostLikelyAmplitudes(circuit);
 
     for (auto [k, v]: result) {
         std::cout << k << "   ->    " << v << std::endl;
